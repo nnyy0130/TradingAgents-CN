@@ -1,0 +1,699 @@
+"""
+提示词模板客户端 - 用于Agent从模板系统获取提示词
+
+直接连接MongoDB获取模板，不通过HTTP API
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from typing import TYPE_CHECKING, Optional, Dict, Any
+from pymongo import MongoClient
+from bson import ObjectId
+from tradingagents.utils.logging_init import get_logger
+
+if TYPE_CHECKING:
+    # 仅类型标注使用；顶层导入会触发 tradingagents.agents 包初始化，
+    # 与 agents/* 模块反向 import 本模块（get_agent_prompt）形成循环导入
+    from tradingagents.agents.utils.agent_context import AgentContext
+
+logger = get_logger("template_client")
+
+
+class TemplateClient:
+    """提示词模板客户端 - 直接连接MongoDB"""
+
+    def __init__(self, mongo_uri: Optional[str] = None, db_name: Optional[str] = None):
+        """
+        初始化模板客户端
+
+        Args:
+            mongo_uri: MongoDB连接字符串，默认从环境变量构建
+            db_name: 数据库名称，默认从环境变量读取
+        """
+        from tradingagents.config.mongodb_utils import build_mongodb_connection_string, get_mongodb_database_name
+
+        self.mongo_uri = mongo_uri or build_mongodb_connection_string()
+        self.db_name = db_name or get_mongodb_database_name()
+
+        # 创建MongoDB连接
+        self.client = MongoClient(self.mongo_uri)
+        self.db = self.client[self.db_name]
+        self.templates_collection = self.db.prompt_templates
+        self.configs_collection = self.db.user_template_configs
+
+        logger.info(f"✅ 模板客户端初始化成功: {self.db_name}")
+
+    def get_effective_template(
+        self,
+        agent_type: str,
+        agent_name: str,
+        user_id: Optional[str] = None,
+        preference_id: Optional[str] = None,
+        context: Optional[AgentContext] = None,
+        workflow_id: Optional[str] = None,  # 🆕 流程专属提示词支持
+        node_id: Optional[str] = None        # 🆕 节点专属提示词支持
+    ) -> Optional[Dict[str, Any]]:
+        """
+        获取有效模板（支持流程专属提示词 + 节点专属提示词）
+
+        优先级顺序：
+        1. 调试模板（is_debug_mode=True 且 debug_template_id 有值）
+        2. 节点专属模板（workflow_id + node_id + agent_name，同一 agent 在不同节点有不同提示词）
+        2.5. 流程专属模板（workflow_id + agent_name，无 node_id 时的降级）
+        3. 用户配置模板（user_id 配置的模板）
+        4. 用户偏好系统模板（preference_type 对应的系统模板）
+        5. 默认系统模板（workflow_id=None 的系统模板）
+
+        Args:
+            agent_type: Agent类型（analysts, researchers, debators, managers, trader）
+            agent_name: Agent名称
+            user_id: 用户ID（可选）
+            preference_id: 偏好ID（可选，默认为neutral）
+            context: AgentContext对象，包含调试模式信息和 workflow_id
+            workflow_id: 🆕 工作流ID（可选，用于加载流程专属提示词）
+            node_id: 🆕 节点ID（可选，同一 agent 在不同节点有不同提示词时使用）
+
+        Returns:
+            模板内容字典，包含system_prompt、tool_guidance、analysis_requirements等字段
+            如果获取失败返回None
+        """
+        try:
+            # 兼容 context 为 dict 或 AgentContext 对象
+            ctx_user = None
+            ctx_pref = None
+            ctx_workflow_id = None  # 🆕 从 context 中提取 workflow_id
+            ctx_node_id = None      # 🆕 从 context 中提取 node_id
+            is_debug_mode = False
+            debug_template_id = None
+
+            if context:
+                if isinstance(context, dict):
+                    ctx_user = context.get('user_id')
+                    ctx_pref = context.get('preference_id')
+                    ctx_workflow_id = context.get('workflow_id')  # 🆕
+                    ctx_node_id = context.get('node_id')          # 🆕
+                    is_debug_mode = context.get('is_debug_mode', False)
+                    debug_template_id = context.get('debug_template_id') if is_debug_mode else None
+                else:
+                    ctx_user = getattr(context, 'user_id', None)
+                    ctx_pref = getattr(context, 'preference_id', None)
+                    ctx_workflow_id = getattr(context, 'workflow_id', None)  # 🆕
+                    ctx_node_id = getattr(context, 'node_id', None)          # 🆕
+                    is_debug_mode = getattr(context, 'is_debug_mode', False)
+                    # 🔥 修复：无论 is_debug_mode 是否为 True，都应该提取 debug_template_id
+                    debug_template_id = getattr(context, 'debug_template_id', None)
+
+            # 🆕 合并 workflow_id 和 node_id：参数优先，context 次之
+            effective_workflow_id = workflow_id or ctx_workflow_id
+            effective_node_id = node_id or ctx_node_id
+
+            # 🔥 调试日志：记录 context 解析结果
+            logger.info(f"🔍 [get_effective_template] Context 解析结果:")
+            logger.info(f"   - context 类型: {type(context)}")
+            logger.info(f"   - is_debug_mode: {is_debug_mode}")
+            logger.info(f"   - debug_template_id: {debug_template_id}")
+            logger.info(f"   - user_id: {ctx_user}")
+            logger.info(f"   - preference_id: {ctx_pref}")
+            logger.info(f"   - workflow_id (参数): {workflow_id}")
+            logger.info(f"   - workflow_id (context): {ctx_workflow_id}")
+            logger.info(f"   - workflow_id (有效): {effective_workflow_id}")
+            logger.info(f"   - node_id (参数): {node_id}")
+            logger.info(f"   - node_id (context): {ctx_node_id}")
+            logger.info(f"   - node_id (有效): {effective_node_id}")
+
+            logger.info(
+                f"[diagnose] input agent_type={agent_type} agent_name={agent_name} "
+                f"user_id={user_id} pref={preference_id} ctx_user={ctx_user} ctx_pref={ctx_pref}"
+            )
+
+            # 🔥 调试模板优先级最高：如果提供了 debug_template_id，直接使用调试模板（最高优先级）
+            # 注意：调试模式下不检查 agent_type 和 agent_name 是否匹配，允许跨类型调试
+            # 🔥 修复：即使 is_debug_mode 为 False，只要提供了 debug_template_id，也应该使用调试模板
+            if debug_template_id:
+                logger.info(f"🔍 [调试模式] 使用调试模板ID: {debug_template_id} (最高优先级)")
+                try:
+                    template_oid = debug_template_id if isinstance(debug_template_id, ObjectId) else ObjectId(str(debug_template_id))
+                    debug_template = self.templates_collection.find_one({"_id": template_oid})
+
+                    if debug_template:
+                        # 🔥 验证模板的 agent_type 和 agent_name（仅用于日志，不阻止使用）
+                        template_agent_type = debug_template.get("agent_type")
+                        template_agent_name = debug_template.get("agent_name")
+                        
+                        if template_agent_type != agent_type or template_agent_name != agent_name:
+                            logger.warning(
+                                f"⚠️ [调试模式] 调试模板的 agent_type/agent_name 不匹配: "
+                                f"模板({template_agent_type}/{template_agent_name}) vs "
+                                f"请求({agent_type}/{agent_name})，但仍使用调试模板（调试模式允许跨类型）"
+                            )
+                        
+                        logger.info(
+                            f"✅ [调试模式] 成功获取调试模板: {agent_type}/{agent_name} "
+                            f"(template_id={debug_template_id}, 模板类型={template_agent_type}/{template_agent_name})"
+                        )
+                        content = debug_template.get("content") or {}
+                        
+                        # 🔥 调试：打印模板内容的详细信息
+                        logger.info(f"🔍 [调试模式] 模板内容字段: {list(content.keys())}")
+                        if "user_prompt" in content:
+                            user_prompt_preview = str(content["user_prompt"])[:200] if content["user_prompt"] else ""
+                            logger.info(f"🔍 [调试模式] user_prompt 长度: {len(str(content.get('user_prompt', '')))}, 前200字符: {user_prompt_preview}")
+                        if "system_prompt" in content:
+                            system_prompt_preview = str(content["system_prompt"])[:200] if content["system_prompt"] else ""
+                            logger.info(f"🔍 [调试模式] system_prompt 长度: {len(str(content.get('system_prompt', '')))}, 前200字符: {system_prompt_preview}")
+                        
+                        content["source"] = "debug"
+                        content["template_id"] = str(debug_template.get("_id"))
+                        content["version"] = debug_template.get("version", 1)
+                        content["is_debug"] = True
+                        logger.info(f"🔍 [调试模式] 调试模板优先级最高，直接返回，跳过后续 agent 配置检查")
+                        return content
+                    else:
+                        logger.warning(f"⚠️ [调试模式] 调试模板不存在: {debug_template_id}，降级到正常流程")
+                except Exception as e:
+                    logger.error(f"❌ [调试模式] 获取调试模板失败: {e}，降级到正常流程")
+            
+            # 🔥 如果启用了调试模式但没有调试模板ID，记录警告但不阻止继续
+            if is_debug_mode and not debug_template_id:
+                logger.warning(f"⚠️ [调试模式] 启用了调试模式但未提供 debug_template_id，将使用正常流程")
+
+            # 默认偏好为neutral
+            # 兼容 context 为 dict 或 AgentContext 对象
+            if context:
+                if isinstance(context, dict):
+                    # context 是字典
+                    preference_id = context.get("preference_id") or preference_id
+                    user_id = context.get("user_id") or user_id
+                else:
+                    # context 是 AgentContext 对象
+                    preference_id = context.preference_id if context.preference_id else preference_id
+                    user_id = context.user_id if context.user_id else user_id
+            preference_id = preference_id or "neutral"
+
+            # 🆕 优先级1.5：节点专属模板 / 流程专属模板
+            # 查询策略：
+            #   1) 有 node_id → 先精确匹配 workflow_id + node_id，再降级到 workflow_id（无 node_id）
+            #   2) 无 node_id → 直接匹配 workflow_id（原有行为）
+            if effective_workflow_id:
+                def _find_workflow_template(extra_filter: dict) -> Optional[dict]:
+                    """辅助：按给定的额外条件查流程模板，先试匹配偏好，再试无偏好"""
+                    base_query = {
+                        "agent_type": agent_type,
+                        "agent_name": agent_name,
+                        "workflow_id": effective_workflow_id,
+                        "status": "active",
+                        **extra_filter,
+                    }
+                    if preference_id:
+                        q = {**base_query, "preference_type": preference_id}
+                        tpl = self.templates_collection.find_one(q)
+                        if tpl:
+                            return tpl
+                        # 降级：无偏好的流程模板
+                        q_no_pref = {**base_query, "preference_type": None}
+                        return self.templates_collection.find_one(q_no_pref)
+                    return self.templates_collection.find_one(base_query)
+
+                workflow_template = None
+                template_source_label = "workflow_specific"
+
+                # 步骤 1：如果有 node_id，优先查节点专属模板
+                if effective_node_id:
+                    workflow_template = _find_workflow_template({"node_id": effective_node_id})
+                    if workflow_template:
+                        template_source_label = "node_specific"
+                        logger.info(
+                            f"✅ [优先级1.5a] 获取节点专属模板: {agent_type}/{agent_name} "
+                            f"(workflow_id={effective_workflow_id}, node_id={effective_node_id})"
+                        )
+
+                # 步骤 2：没有节点专属模板，降级为不含 node_id 的流程模板（兼容旧数据）
+                # 仅匹配 node_id 为空/不存在的文档，避免误匹配节点专属模板
+                if not workflow_template:
+                    workflow_template = _find_workflow_template({
+                        "$or": [
+                            {"node_id": {"$exists": False}},
+                            {"node_id": None},
+                            {"node_id": ""}
+                        ]
+                    })
+                    if workflow_template:
+                        logger.info(
+                            f"✅ [优先级1.5b] 获取流程专属模板: {agent_type}/{agent_name} "
+                            f"(workflow_id={effective_workflow_id}, node_id={effective_node_id or 'N/A'})"
+                        )
+
+                if workflow_template:
+                    content = workflow_template.get("content") or {}
+                    content["source"] = template_source_label
+                    content["template_id"] = str(workflow_template.get("_id"))
+                    content["version"] = workflow_template.get("version", 1)
+                    content["workflow_id"] = effective_workflow_id
+                    content["node_id"] = effective_node_id or ""
+                    content["selected_preference"] = preference_id
+                    return content
+                else:
+                    logger.info(
+                        f"📝 [优先级1.5] 未找到流程/节点专属模板: {agent_type}/{agent_name} "
+                        f"(workflow_id={effective_workflow_id}, node_id={effective_node_id or 'N/A'})，继续查找默认模板"
+                    )
+
+            # 1. 优先级1：如果指定了user_id，先检查用户在agent配置中是否设置了模板
+            if user_id:
+                user_oid = None
+                try:
+                    user_oid = user_id if isinstance(user_id, ObjectId) else ObjectId(str(user_id))
+                except Exception:
+                    user_oid = None
+
+                if user_oid:
+                    config_query = {
+                        "user_id": user_oid,
+                        "agent_type": agent_type,
+                        "agent_name": agent_name,
+                        "is_active": True
+                    }
+                    logger.info(f"[diagnose] config_query={config_query}")
+                    config = self.configs_collection.find_one(config_query)
+
+                    if config and config.get("template_id"):
+                        template_oid = None
+                        try:
+                            tid = config["template_id"]
+                            template_oid = tid if isinstance(tid, ObjectId) else ObjectId(str(tid))
+                        except Exception:
+                            template_oid = None
+                            logger.info(f"[diagnose] template_id_convert_failed raw={config.get('template_id')}")
+
+                        # 🔥 只使用已发布状态的模板
+                        template = self.templates_collection.find_one({
+                            "_id": template_oid,
+                            "status": "active"
+                        }) if template_oid else None
+
+                        if template:
+                            logger.info(
+                                f"[diagnose] path=user_active_config config_id={config.get('_id')} "
+                                f"template_id={template.get('_id')} version={template.get('version')} pref={config.get('preference_id')}"
+                            )
+                            logger.info(
+                                f"✅ [优先级1] 获取用户在agent配置中设置的模板: {agent_type}/{agent_name} "
+                                f"(user_id={user_id}, template_id={template_oid})"
+                            )
+                            content = template.get("content") or {}
+                            content["source"] = "user_config"
+                            content["template_id"] = str(template.get("_id"))
+                            content["version"] = template.get("version", 1)
+                            content["selected_preference"] = config.get("preference_id") or preference_id
+                            return content
+                        else:
+                            # 如果用户配置的模板是草稿状态，记录警告并跳过
+                            logger.warning(
+                                f"⚠️ 用户配置的模板 {template_oid} 不是已发布状态或不存在，降级到用户偏好模板"
+                            )
+                            logger.info("[diagnose] user_config_found_but_template_lookup_failed_or_not_active")
+
+            # 2. 优先级2：查找用户偏好对应的【默认】系统模板
+            # 🔥 向后兼容：仅匹配 workflow_id 为空或不存在（旧默认模板），排除流程专属模板
+            system_query = {
+                "agent_type": agent_type,
+                "agent_name": agent_name,
+                "preference_type": preference_id,
+                "is_system": True,
+                "status": "active",
+                "$or": [{"workflow_id": {"$exists": False}}, {"workflow_id": None}]
+            }
+
+            system_template = self.templates_collection.find_one(system_query)
+
+            if system_template:
+                logger.info(
+                    f"✅ [优先级2] 获取用户偏好对应的系统模板: {agent_type}/{agent_name} (preference={preference_id})"
+                )
+                logger.info(f"[diagnose] path=system_fallback system_query={system_query}")
+                content = system_template.get("content") or {}
+                content["source"] = "system"
+                content["template_id"] = str(system_template.get("_id"))
+                content["version"] = system_template.get("version", 1)
+                content["selected_preference"] = preference_id
+                return content
+
+            # 3. 优先级3：如果没有找到用户偏好对应的模板，降级到默认neutral模板
+            # 🔥 向后兼容：仅匹配默认模板（workflow_id 为空或不存在）
+            if preference_id != "neutral":
+                logger.info(
+                    f"⚠️ 未找到偏好 {preference_id} 的系统模板，降级到默认neutral模板: {agent_type}/{agent_name}"
+                )
+                neutral_query = {
+                    "agent_type": agent_type,
+                    "agent_name": agent_name,
+                    "preference_type": "neutral",
+                    "is_system": True,
+                    "status": "active",
+                    "$or": [{"workflow_id": {"$exists": False}}, {"workflow_id": None}]
+                }
+                neutral_template = self.templates_collection.find_one(neutral_query)
+                if neutral_template:
+                    logger.info(f"✅ [优先级3] 获取默认neutral系统模板: {agent_type}/{agent_name}")
+                    content = neutral_template.get("content") or {}
+                    content["source"] = "system"
+                    content["template_id"] = str(neutral_template.get("_id"))
+                    content["version"] = neutral_template.get("version", 1)
+                    content["selected_preference"] = "neutral"
+                    return content
+
+            logger.error(
+                f"❌ 未找到任何可用模板: {agent_type}/{agent_name} (preference={preference_id})"
+            )
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ 获取模板异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def format_template(
+        self,
+        template_content: Dict[str, Any],
+        variables: Dict[str, Any]
+    ) -> Dict[str, str]:
+        """
+        格式化模板，替换变量
+
+        支持两种语法：
+        1. 单层花括号：{variable_name}
+        2. 双层花括号（Jinja2风格）：{{variable.nested_key}}
+
+        Args:
+            template_content: 模板内容字典（从get_effective_template返回）
+            variables: 变量字典，支持嵌套，如 {"trade": {"code": "300274"}}
+
+        Returns:
+            格式化后的模板内容字典
+        """
+        try:
+            # 分层提示词三块变量：未传入时默认为空，避免模板占位符被渲染为 None（设计文档 §5.3）
+            if variables is not None:
+                variables = dict(variables)
+                variables.setdefault("analysis_context_block", "")
+                variables.setdefault("capability_block", "")
+                variables.setdefault("task_block", "")
+            else:
+                variables = {
+                    "analysis_context_block": "",
+                    "capability_block": "",
+                    "task_block": "",
+                }
+
+            # 打印输入的变量（调试用）
+            logger.info(f"🔧 [format_template] 输入变量 (共 {len(variables)} 个):")
+            if not variables:
+                logger.warning(f"⚠️ [format_template] 变量字典为空！")
+            else:
+                for k, v in variables.items():
+                    if isinstance(v, str) and len(v) > 100:
+                        logger.info(f"  - {k}: {v[:100]}...")
+                    else:
+                        logger.info(f"  - {k}: {v}")
+
+            def get_nested_value(data: Dict[str, Any], path: str) -> Any:
+                """获取嵌套字典的值，支持点号路径如 'trade.code'"""
+                keys = path.split('.')
+                value = data
+                for key in keys:
+                    if isinstance(value, dict):
+                        value = value.get(key, '')
+                    else:
+                        return ''
+                return value
+
+            def replace_variable(match):
+                """替换变量占位符"""
+                var_path = match.group(1).strip()
+                value = get_nested_value(variables, var_path)
+                # logger.info(f"  替换 {{{{{var_path}}}}} -> {value}")  # 太多了，注释掉
+                return str(value) if value is not None else ''
+
+            formatted = {}
+
+            # 🔧 支持两种语法：
+            # 1. 双层花括号 {{variable.path}}（Jinja2风格，优先级高）
+            # 2. 单层花括号 {variable}（简单变量，避免与内容冲突）
+            # 先处理双层花括号，再处理单层花括号（避免冲突）
+            double_brace_pattern = re.compile(r'\{\{([^}]+)\}\}')
+            # 单层花括号：只匹配 {变量名}，变量名只能是字母、数字、下划线的组合
+            single_brace_pattern = re.compile(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}')
+
+            for key, value in template_content.items():
+                if isinstance(value, str):
+                    formatted_value = value
+                    
+                    # 第一步：替换双层花括号变量 {{variable.path}}
+                    def replacer_double(match):
+                        var_path = match.group(1).strip()
+                        val = get_nested_value(variables, var_path)
+                        return str(val) if val is not None else ''
+                    
+                    formatted_value = double_brace_pattern.sub(replacer_double, formatted_value)
+                    
+                    # 第二步：替换单层花括号变量 {variable}（仅匹配简单变量名）
+                    def replacer_single(match):
+                        var_name = match.group(1).strip()
+                        # 直接从variables字典中获取（不支持嵌套路径）
+                        val = variables.get(var_name)
+                        return str(val) if val is not None else ''
+                    
+                    formatted_value = single_brace_pattern.sub(replacer_single, formatted_value)
+                    formatted[key] = formatted_value
+
+                    # 检查是否还有未替换的变量（只针对system_prompt和user_prompt）
+                    if key in ['system_prompt', 'user_prompt']:
+                        # 检查双层花括号
+                        unmatched_double = re.findall(r'\{\{([^}]+)\}\}', formatted_value)
+                        # 检查单层花括号（简单变量名）
+                        unmatched_single = re.findall(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', formatted_value)
+                        if unmatched_double or unmatched_single:
+                            total_unmatched = len(unmatched_double) + len(unmatched_single)
+                            logger.warning(f"⚠️ [模板渲染] {key} 中可能有 {total_unmatched} 个未渲染的变量")
+                            # 显示前200字符
+                            logger.warning(f"⚠️ [模板渲染] {key} 前200字符: {formatted_value[:200]}")
+                            if unmatched_double:
+                                for var_name in unmatched_double:
+                                    logger.warning(f"  - 未替换(双层): {var_name}")
+                            if unmatched_single:
+                                for var_name in unmatched_single:
+                                    logger.warning(f"  - 未替换(单层): {var_name}")
+                else:
+                    formatted[key] = value
+
+            return formatted
+
+        except Exception as e:
+            logger.error(f"[TemplateClient] 格式化模板异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+
+
+# 全局单例
+_template_client = None
+
+
+def get_template_client() -> TemplateClient:
+    """获取全局模板客户端单例"""
+    global _template_client
+    if _template_client is None:
+        _template_client = TemplateClient()
+    return _template_client
+
+
+def get_agent_prompt(
+    agent_type: str,
+    agent_name: str,
+    variables: Dict[str, str],
+    user_id: Optional[str] = None,
+    preference_id: Optional[str] = None,
+    fallback_prompt: Optional[str] = None,
+    context: Optional[AgentContext] = None,
+    workflow_id: Optional[str] = None,  # 🆕 流程专属提示词支持
+    node_id: Optional[str] = None        # 🆕 节点专属提示词支持
+) -> str:
+    """
+    获取Agent提示词（便捷函数）
+
+    Args:
+        agent_type: Agent类型
+        agent_name: Agent名称
+        variables: 模板变量字典（如ticker、company_name、current_date等）
+        user_id: 用户ID（可选）
+        preference_id: 偏好ID（可选）
+        fallback_prompt: 降级提示词（当API不可用时使用）
+        context: AgentContext对象
+        workflow_id: 🆕 工作流ID（可选，用于加载流程专属提示词）
+        node_id: 🆕 节点ID（可选，同一 agent 在不同节点加载不同提示词）
+
+    Returns:
+        完整的提示词字符串
+    """
+    try:
+        client = get_template_client()
+
+        # 从MongoDB获取模板（支持流程专属提示词 + 节点专属提示词）
+        template_content = client.get_effective_template(
+            agent_type, agent_name, user_id, preference_id, context, workflow_id, node_id
+        )
+
+        if template_content:
+            logger.info(f"📝 [模板渲染] 开始格式化模板，变量数量: {len(variables)}")
+            logger.info(f"📝 [模板渲染] 模板字段: {list(template_content.keys())}")
+
+            # 格式化模板
+            formatted = client.format_template(template_content, variables)
+
+            logger.info(f"📝 [模板渲染] 格式化完成，检查渲染结果...")
+            # 检查是否还有未渲染的变量
+            for key, value in formatted.items():
+                if isinstance(value, str) and ('{{' in value or '{' in value):
+                    # 检查双层花括号
+                    unmatched_double = re.findall(r'\{\{([^}]+)\}\}', value)
+                    # 检查单层花括号（简单变量名）
+                    unmatched_single = re.findall(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', value)
+
+                    if unmatched_double or unmatched_single:
+                        total_unmatched = len(unmatched_double) + len(unmatched_single)
+                        logger.warning(f"⚠️ [模板渲染] {key} 中可能有 {total_unmatched} 个未渲染的变量")
+                        # 显示前200字符
+                        logger.warning(f"⚠️ [模板渲染] {key} 前200字符: {value[:200]}")
+                        # 打印具体的未渲染变量名
+                        if unmatched_double:
+                            logger.warning(f"  📌 未渲染变量(双层花括号): {', '.join(unmatched_double)}")
+                        if unmatched_single:
+                            logger.warning(f"  📌 未渲染变量(单层花括号): {', '.join(unmatched_single)}")
+
+            # 组合完整提示词
+            parts = []
+            if formatted.get("system_prompt"):
+                parts.append(formatted["system_prompt"])
+            if formatted.get("tool_guidance"):
+                parts.append("\n\n" + formatted["tool_guidance"])
+            if formatted.get("analysis_requirements"):
+                parts.append("\n\n" + formatted["analysis_requirements"])
+            if formatted.get("output_format"):
+                parts.append("\n\n" + formatted["output_format"])
+            if formatted.get("constraints"):
+                parts.append("\n\n" + formatted["constraints"])
+
+            prompt = "\n".join(parts)
+            logger.info(f"✅ 成功生成提示词: {agent_type}/{agent_name} (长度: {len(prompt)})")
+            logger.info(f"📝 [模板渲染] 提示词: {prompt}")
+            return prompt
+        else:
+            # 降级：使用硬编码提示词
+            logger.warning(
+                f"⚠️ 无法获取模板，使用降级提示词: {agent_type}/{agent_name}"
+            )
+            return fallback_prompt or "请进行分析。"
+
+    except Exception as e:
+        logger.error(f"❌ 获取提示词异常: {e}")
+        return fallback_prompt or "请进行分析。"
+
+
+def get_user_prompt(
+    agent_type: str,
+    agent_name: str,
+    variables: Dict[str, Any],
+    user_id: Optional[str] = None,
+    preference_id: Optional[str] = None,
+    fallback_prompt: Optional[str] = None,
+    context: Optional[AgentContext] = None,
+    workflow_id: Optional[str] = None,  # 🆕 流程专属提示词支持
+    node_id: Optional[str] = None        # 🆕 节点专属提示词支持
+) -> str:
+    """
+    获取Agent用户提示词（便捷函数）
+
+    Args:
+        agent_type: Agent类型
+        agent_name: Agent名称
+        variables: 模板变量字典（包含所有需要替换的数据）
+        user_id: 用户ID（可选）
+        preference_id: 偏好ID（可选）
+        fallback_prompt: 降级提示词（当API不可用时使用）
+        context: AgentContext对象
+        workflow_id: 🆕 工作流ID（可选，用于加载流程专属提示词）
+        node_id: 🆕 节点ID（可选，同一 agent 在不同节点加载不同提示词）
+
+    Returns:
+        渲染后的用户提示词字符串
+    """
+    try:
+        # 🔍 调试：打印接收到的变量
+        logger.info(f"🔍 [get_user_prompt] 接收到的变量 (共 {len(variables)} 个):")
+        if not variables:
+            logger.warning(f"⚠️ [get_user_prompt] 变量字典为空！")
+        else:
+            for k, v in variables.items():
+                if isinstance(v, str) and len(v) > 100:
+                    logger.info(f"  - {k}: {v[:100]}...")
+                else:
+                    logger.info(f"  - {k}: {v}")
+
+        client = get_template_client()
+
+        # 从MongoDB获取模板（支持流程专属提示词 + 节点专属提示词）
+        template_content = client.get_effective_template(
+            agent_type, agent_name, user_id, preference_id, context, workflow_id, node_id
+        )
+
+        if template_content:
+            # 格式化模板
+            formatted = client.format_template(template_content, variables)
+
+            # 返回用户提示词
+            user_prompt = formatted.get("user_prompt", "")
+            if user_prompt:
+                # 检查是否还有未渲染的变量
+                unmatched_double = re.findall(r'\{\{([^}]+)\}\}', user_prompt)
+                unmatched_single = re.findall(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', user_prompt)
+
+                if unmatched_double or unmatched_single:
+                    total_unmatched = len(unmatched_double) + len(unmatched_single)
+                    logger.warning(f"⚠️ [get_user_prompt] user_prompt 中可能有 {total_unmatched} 个未渲染的变量")
+                    logger.warning(f"⚠️ [get_user_prompt] user_prompt 前200字符: {user_prompt[:200]}")
+                    if unmatched_double:
+                        logger.warning(f"  📌 未渲染变量(双层花括号): {', '.join(unmatched_double)}")
+                    if unmatched_single:
+                        logger.warning(f"  📌 未渲染变量(单层花括号): {', '.join(unmatched_single)}")
+
+                logger.info(f"✅ 成功生成用户提示词: {agent_type}/{agent_name} (长度: {len(user_prompt)})")
+                logger.info(f"📝 [get_user_prompt] 用户提示词: {user_prompt}")
+                return user_prompt
+            else:
+                logger.warning(f"⚠️ 模板中没有 user_prompt 字段，使用降级提示词: {agent_type}/{agent_name}")
+                return fallback_prompt or "请进行分析。"
+        else:
+            # 降级：使用硬编码提示词
+            logger.warning(
+                f"⚠️ 无法获取模板，使用降级提示词: {agent_type}/{agent_name}"
+            )
+            return fallback_prompt or "请进行分析。"
+
+    except Exception as e:
+        logger.error(f"❌ 获取用户提示词异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return fallback_prompt or "请进行分析。"
+
+
+def close_template_client():
+    """关闭全局模板客户端连接"""
+    global _template_client
+    if _template_client is not None:
+        _template_client.client.close()
+        _template_client = None
+        logger.info("✅ 模板客户端连接已关闭")
+

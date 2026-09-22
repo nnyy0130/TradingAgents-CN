@@ -1,0 +1,242 @@
+"""
+归因分析师 v2.0 (复盘分析)
+
+基于ResearcherAgent基类实现的归因分析师
+"""
+
+import logging
+from typing import Dict, Any, List
+
+from ...researcher import ResearcherAgent
+from ...config import AgentMetadata, AgentCategory, LicenseTier, AgentInput, AgentOutput
+from ...registry import register_agent
+
+logger = logging.getLogger(__name__)
+
+# 尝试导入模板系统
+try:
+    from tradingagents.utils.template_client import get_agent_prompt, get_user_prompt
+except (ImportError, KeyError) as e:
+    logger.warning(f"无法导入模板系统: {e}")
+    get_agent_prompt = None
+    get_user_prompt = None
+
+# 不再需要直接导入 get_agent_prompt/get_user_prompt，使用基类的 _get_prompt_from_template 方法
+
+
+@register_agent
+class AttributionAnalystV2(ResearcherAgent):
+    """
+    归因分析师 v2.0 (复盘分析)
+    
+    功能：
+    - 分析收益来源
+    - 区分大盘/行业/个股Alpha贡献
+    - 评估可复制能力与偶然因素
+    
+    工作流程：
+    1. 读取交易信息和基准数据
+    2. 使用LLM分析收益归因
+    3. 生成归因分析报告
+    
+    示例:
+        from langchain_openai import ChatOpenAI
+        from core.agents import create_agent
+
+        llm = ChatOpenAI(model="gpt-4")
+        agent = create_agent("attribution_analyst_v2", llm)
+
+        result = agent.execute({
+            "trade_info": {...},
+            "benchmark_data": {...}
+        })
+    """
+
+    # Agent元数据
+    metadata = AgentMetadata(
+        id="attribution_analyst_v2",
+        name="归因分析师 v2.0",
+        description="分析收益来源，区分大盘/行业/个股Alpha贡献与可复制性",
+        category=AgentCategory.ANALYST,
+        version="2.0.0",
+        license_tier=LicenseTier.FREE,
+        default_tools=[],
+        inputs=[
+            AgentInput(name="ticker", type="string", description="股票代码"),
+            AgentInput(name="trade_records", type="string", description="交易记录"),
+            AgentInput(name="trade_info", type="object", description="交易信息详情", required=False),
+            AgentInput(name="market_data", type="object", description="市场行情数据", required=False),
+            AgentInput(name="benchmark_data", type="object", description="基准数据", required=False),
+        ],
+        outputs=[
+            AgentOutput(name="attribution_analysis", type="string", description="归因分析结果"),
+        ],
+        growth_role="extractor",
+        growth_outputs=["attribution_analysis"],
+        memory_scope_hint="pattern",
+        review_level="auto_pending",
+        growth_source_type="review_report",
+    )
+
+    researcher_type = "review_attribution"
+    stance = "neutral"
+    output_field = "attribution_analysis"
+
+    def _build_system_prompt(self, stance: str, state: Dict[str, Any] = None) -> str:
+        """
+        构建系统提示词
+        
+        Args:
+            stance: 研究立场
+            state: 工作流状态（可选，用于提取变量如 company_name, ticker 等）
+        """
+        # 使用基类的通用方法从模板系统获取提示词（参考 research_manager_v2）
+        logger.info("🔍 [AttributionAnalystV2] 开始构建系统提示词")
+        
+        prompt = self._get_prompt_from_template(
+            agent_type="reviewers_v2",
+            agent_name="attribution_analyst_v2",
+            variables={},  # 系统提示词不需要变量（参考 research_manager_v2）
+            state=state,  # 🔑 传递 state，基类会自动提取系统变量
+            context=state.get("context") if state else None,  # 从 state 中获取 context
+            fallback_prompt=None,
+            prompt_type="system"  # 🔑 关键：明确指定获取系统提示词
+        )
+        
+        logger.info(f"📝 系统提示词长度: {len(prompt)} 字符")
+        if prompt:
+            logger.info(f"✅ 从模板系统获取归因分析师提示词 (长度: {len(prompt)})")
+            return prompt
+        
+        return """您是一位专业的归因分析师。
+
+您的职责是分析收益或亏损的来源构成，并识别哪些因素可复制、哪些属于偶然。
+
+分析要点：
+1. Beta收益 - 大盘贡献的收益
+2. 行业超额 - 行业相对大盘的超额收益
+3. 个股Alpha - 选股能力带来的超额收益
+4. 择时贡献 - 买卖时机选择的贡献
+5. 可复制性 - 哪些经验可复用、哪些不应过度归功
+6. 后续研究与复盘补强重点 - 哪些证据需要继续补强、哪些结论应谨慎归因
+
+严格要求：改进建议只能写成研究与复盘能力提升方向，不得写成未来交易动作。
+
+请使用中文，基于真实数据进行分析。"""
+
+    def _build_user_prompt(
+        self,
+        ticker: str,
+        analysis_date: str,
+        reports: Dict[str, str],
+        historical_context: str,
+        state: Dict[str, Any]
+    ) -> str:
+        """构建用户提示词（从模板系统获取并渲染）"""
+        trade_info = state.get("trade_info", {})
+        benchmark_data = state.get("benchmark_data", {})
+
+        code = trade_info.get("code", ticker)
+        name = trade_info.get("name", code)
+        # 🆕 使用总收益率（已实现 + 浮动盈亏）
+        realized_pnl_pct = trade_info.get("realized_pnl_pct", 0)
+        unrealized_pnl_pct = trade_info.get("unrealized_pnl_pct", 0)
+        is_holding = trade_info.get("is_holding", False)
+        
+        # 🆕 计算总收益率（包含浮动盈亏）
+        total_pnl_pct = realized_pnl_pct + unrealized_pnl_pct if is_holding else realized_pnl_pct
+        stock_return = total_pnl_pct / 100  # 转换为小数
+        
+        market_return = benchmark_data.get("market_return", 0)
+        industry_return = benchmark_data.get("industry_return", 0)
+        industry_name = benchmark_data.get("industry_name", "未知行业")
+
+        # 计算超额收益
+        market_excess = stock_return - market_return
+        industry_excess = industry_return - market_return
+        stock_alpha = stock_return - industry_return
+
+        # 准备模板变量
+        template_variables = {
+            'code': code,
+            'name': name,
+            'stock_return': f"{stock_return * 100:.2f}",
+            'realized_pnl_pct': f"{realized_pnl_pct:.2f}",
+            'unrealized_pnl_pct': f"{unrealized_pnl_pct:.2f}",
+            'is_holding': "是" if is_holding else "否",
+            'holding_days': trade_info.get('holding_days', 0),
+            'market_return': f"{market_return * 100:.2f}",
+            'industry_name': industry_name,
+            'industry_return': f"{industry_return * 100:.2f}",
+            'market_excess': f"{market_excess * 100:.2f}",
+            'industry_excess': f"{industry_excess * 100:.2f}",
+            'stock_alpha': f"{stock_alpha * 100:.2f}"
+        }
+
+        # 🆕 构建收益率信息（包含浮动盈亏）- 用于模板变量
+        if is_holding and unrealized_pnl_pct != 0:
+            return_info_text = f"{stock_return:.2%} (已实现: {realized_pnl_pct/100:.2%}, 浮动: {unrealized_pnl_pct/100:+.2%})"
+        else:
+            return_info_text = f"{stock_return:.2%}"
+        
+        template_variables['return_info'] = return_info_text
+        template_variables['holding_status'] = f"{'持仓中' if is_holding else '已平仓'}"
+        
+        # 降级提示词（如果模板系统不可用）
+        fallback_prompt = f"""请分析以下交易的收益归因：
+
+=== 交易信息 ===
+- 股票代码: {code}
+- 股票名称: {name}
+- 股票总收益率: {return_info_text}
+- 持仓周期: {trade_info.get('holding_days', 0)}天
+- 持仓状态: {'持仓中' if is_holding else '已平仓'}
+
+=== 基准数据 ===
+- 大盘收益率: {market_return:.2%}
+- 行业: {industry_name}
+- 行业收益率: {industry_return:.2%}
+
+=== 超额收益分解 ===
+- 相对大盘超额: {market_excess:.2%}
+- 行业超额收益: {industry_excess:.2%}
+- 个股Alpha: {stock_alpha:.2%}
+
+请撰写详细的归因分析报告，包括：
+1. Beta收益分析（大盘贡献）
+2. 行业超额收益分析
+3. 个股Alpha分析（选股能力）
+4. 择时贡献分析
+5. 可复制性与偶然因素分析
+6. 后续研究与复盘补强重点
+
+禁止输出未来交易动作、目标价、止损止盈或仓位方案。"""
+
+        # 打印模板变量（调试用）
+        logger.info(f"📊 [归因分析师] 模板变量:")
+        for key, value in template_variables.items():
+            logger.info(f"  - {key}: {value}")
+
+        # 使用基类的通用方法获取用户提示词（会从 context/state 中提取 preference）
+        prompt = self._get_prompt_from_template(
+            agent_type="reviewers_v2",
+            agent_name="attribution_analyst_v2",
+            variables=template_variables,
+            state=state,  # 🔑 传递 state，基类会自动提取系统变量
+            context=state.get("context") if isinstance(state, dict) else state,  # 从 state 中获取 context
+            fallback_prompt=fallback_prompt,
+            prompt_type="user"  # 🔑 明确指定获取用户提示词
+        )
+        if prompt:
+            logger.info(f"✅ 从模板系统获取归因分析师用户提示词 (长度: {len(prompt)})")
+            logger.info(f"📝 [归因分析师] 最终用户提示词:\n{prompt}")
+            return prompt
+
+        # 降级：使用硬编码提示词
+        logger.info(f"📝 [归因分析师] 使用降级提示词:\n{fallback_prompt}")
+        return fallback_prompt
+
+    def _get_required_reports(self) -> List[str]:
+        """获取需要的数据列表"""
+        return ["trade_info", "benchmark_data"]
+

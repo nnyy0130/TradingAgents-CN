@@ -1,0 +1,133 @@
+<template>
+  <div class="history-positions-table">
+    <el-table :data="items" v-loading="loading" stripe>
+      <el-table-column prop="code" label="股票代码" width="100">
+        <template #default="{ row }">
+          <el-link type="primary" :href="`/stocks/${row.code}`" class="stock-link">
+            {{ row.code }}
+          </el-link>
+        </template>
+      </el-table-column>
+      <el-table-column prop="name" label="股票名称" width="120">
+        <template #default="{ row }">
+          <el-link type="primary" :href="`/stocks/${row.code}`" class="stock-link">
+            {{ row.name }}
+          </el-link>
+        </template>
+      </el-table-column>
+      <el-table-column prop="market" label="市场" width="70">
+        <template #default="{ row }">
+          <el-tag size="small" :type="getMarketType(row.market)">{{ row.market }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="realized_pnl" label="已实现盈亏" width="120" align="right">
+        <template #default="{ row }">
+          <span :class="row.realized_pnl >= 0 ? 'positive' : 'negative'">
+            {{ formatPnl(row.realized_pnl) }}
+          </span>
+        </template>
+      </el-table-column>
+      <el-table-column prop="realized_pnl_pct" label="收益率" width="100" align="right">
+        <template #default="{ row }">
+          <span :class="row.realized_pnl_pct >= 0 ? 'positive' : 'negative'">
+            {{ formatPct(row.realized_pnl_pct) }}
+          </span>
+        </template>
+      </el-table-column>
+      <el-table-column prop="hold_days" label="持有天数" width="100" align="right">
+        <template #default="{ row }">
+          {{ row.hold_days || '-' }} 天
+        </template>
+      </el-table-column>
+      <el-table-column prop="cleared_at" label="清仓时间" width="160">
+        <template #default="{ row }">
+          {{ formatDateTime(row.cleared_at) }}
+        </template>
+      </el-table-column>
+      <el-table-column label="操作" width="100" fixed="right">
+        <template #default="{ row }">
+          <el-button type="primary" link size="small" @click="handleStartReview(row)">
+            发起复盘
+          </el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+    
+    <el-empty v-if="!loading && items.length === 0" description="暂无历史持仓" />
+  </div>
+</template>
+
+<script setup lang="ts">
+type TagType = 'primary' | 'success' | 'warning' | 'info' | 'danger'
+
+interface HistoryPositionItem {
+  code: string
+  name: string
+  market: string
+  realized_pnl: number
+  realized_pnl_pct: number
+  hold_days: number
+  cleared_at: string
+}
+
+defineProps<{
+  items: HistoryPositionItem[]
+  loading: boolean
+}>()
+
+const emit = defineEmits<{
+  (e: 'start-review', item: HistoryPositionItem): void
+}>()
+
+const getMarketType = (market: string): TagType => {
+  const map: Record<string, TagType> = {
+    CN: 'danger'
+  }
+  return map[market] || 'info'
+}
+
+const formatPnl = (val?: number) => {
+  if (val === undefined || val === null) return '-'
+  const prefix = val >= 0 ? '+' : ''
+  return prefix + val.toFixed(2)
+}
+
+const formatPct = (val?: number) => {
+  if (val === undefined || val === null) return '-'
+  const prefix = val >= 0 ? '+' : ''
+  return prefix + val.toFixed(2) + '%'
+}
+
+const formatDateTime = (dateStr?: string) => {
+  if (!dateStr) return '-'
+  const d = new Date(dateStr)
+  return d.toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  })
+}
+
+const handleStartReview = (item: HistoryPositionItem) => {
+  emit('start-review', item)
+}
+</script>
+
+<style scoped lang="scss">
+.history-positions-table {
+  .positive { color: #f56c6c; }  // 中国习惯：红色表示盈利（正数）
+  .negative { color: #67c23a; }  // 中国习惯：绿色表示亏损（负数）
+
+  .stock-link {
+    font-weight: 500;
+    text-decoration: none;
+
+    &:hover {
+      text-decoration: underline;
+    }
+  }
+}
+</style>
+

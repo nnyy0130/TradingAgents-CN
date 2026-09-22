@@ -1,0 +1,264 @@
+"""
+情绪分析师 v2.0 (复盘分析)
+
+基于ResearcherAgent基类实现的情绪分析师
+"""
+
+import logging
+from typing import Dict, Any, List
+
+from ...researcher import ResearcherAgent
+from ...config import AgentMetadata, AgentCategory, LicenseTier, AgentInput, AgentOutput
+from ...registry import register_agent
+
+logger = logging.getLogger(__name__)
+
+# 尝试导入模板系统
+try:
+    from tradingagents.utils.template_client import get_agent_prompt, get_user_prompt
+except (ImportError, KeyError) as e:
+    logger.warning(f"无法导入模板系统: {e}")
+    get_agent_prompt = None
+    get_user_prompt = None
+
+# 不再需要直接导入 get_agent_prompt/get_user_prompt，使用基类的 _get_prompt_from_template 方法
+
+
+@register_agent
+class EmotionAnalystV2(ResearcherAgent):
+    """
+    情绪分析师 v2.0 (复盘分析)
+    
+    功能：
+    - 分析交易中的情绪化操作
+    - 评估交易纪律执行情况
+    - 识别追涨杀跌行为
+    
+    工作流程：
+    1. 读取交易信息和市场数据
+    2. 使用LLM分析情绪控制
+    3. 生成情绪分析报告
+    
+    示例:
+        from langchain_openai import ChatOpenAI
+        from core.agents import create_agent
+
+        llm = ChatOpenAI(model="gpt-4")
+        agent = create_agent("emotion_analyst_v2", llm)
+
+        result = agent.execute({
+            "trade_info": {...},
+            "market_data": {...}
+        })
+    """
+
+    # Agent元数据
+    metadata = AgentMetadata(
+        id="emotion_analyst_v2",
+        name="情绪分析师 v2.0",
+        description="分析交易中的情绪化操作和纪律执行情况",
+        category=AgentCategory.ANALYST,
+        version="2.0.0",
+        license_tier=LicenseTier.FREE,
+        default_tools=[],
+        inputs=[
+            AgentInput(name="ticker", type="string", description="股票代码"),
+            AgentInput(name="trade_records", type="string", description="交易记录"),
+            AgentInput(name="trade_info", type="object", description="交易信息详情", required=False),
+            AgentInput(name="market_data", type="object", description="市场行情数据", required=False),
+            AgentInput(name="benchmark_data", type="object", description="基准数据", required=False),
+        ],
+        outputs=[
+            AgentOutput(name="emotion_analysis", type="string", description="情绪分析结果"),
+        ],
+        growth_role="extractor",
+        growth_outputs=["emotion_analysis"],
+        memory_scope_hint="pattern",
+        review_level="manual_required",
+        growth_source_type="review_report",
+    )
+
+    researcher_type = "review_emotion"
+    stance = "neutral"
+    output_field = "emotion_analysis"
+
+    def _build_system_prompt(self, stance: str, state: Dict[str, Any] = None) -> str:
+        """
+        构建系统提示词
+        
+        Args:
+            stance: 研究立场
+            state: 工作流状态（可选，用于提取变量如 company_name, ticker 等）
+        """
+        # 使用基类的通用方法从模板系统获取提示词（参考 research_manager_v2）
+        logger.info("🔍 [EmotionAnalystV2] 开始构建系统提示词")
+        
+        prompt = self._get_prompt_from_template(
+            agent_type="reviewers_v2",
+            agent_name="emotion_analyst_v2",
+            variables={},  # 系统提示词不需要变量（参考 research_manager_v2）
+            state=state,  # 🔑 传递 state，基类会自动提取系统变量
+            context=state.get("context") if state else None,  # 从 state 中获取 context
+            fallback_prompt=None,
+            prompt_type="system"  # 🔑 关键：明确指定获取系统提示词
+        )
+        
+        logger.info(f"📝 系统提示词长度: {len(prompt)} 字符")
+        if prompt:
+            logger.info(f"✅ 从模板系统获取情绪分析师提示词 (长度: {len(prompt)})")
+            return prompt
+        
+        return """您是一位专业的情绪分析师。
+
+您的职责是分析交易中的情绪控制和纪律执行。
+
+分析要点：
+1. 追涨杀跌 - 是否存在追涨杀跌行为
+2. 恐慌抛售 - 是否因恐慌而抛售
+3. 贪婪持有 - 是否因贪婪而过度持有
+4. 交易纪律 - 交易纪律执行情况
+5. 需补强的情绪与纪律要点 - 本次复盘后应补充哪些约束、记录或触发器
+
+严格要求：改进建议只能写成情绪识别、纪律约束和复盘习惯优化，不得写成未来买卖指令。
+
+**重要约束**：
+- 必须使用用户提示词中提供的真实数据（股票代码、股票名称、收益金额、收益率等）
+- 不要在报告中编造或硬编码任何数据
+- 报告中的所有数字必须与提示词中提供的数据完全一致
+- 不要生成日期信息（如"分析日期：2025年4月5日"），日期由系统自动生成
+
+请使用中文，基于真实数据进行分析。"""
+
+    def _build_user_prompt(
+        self,
+        ticker: str,
+        analysis_date: str,
+        reports: Dict[str, str],
+        historical_context: str,
+        state: Dict[str, Any]
+    ) -> str:
+        """构建用户提示词（从模板系统获取并渲染）"""
+        trade_info = state.get("trade_info", {})
+        market_data = state.get("market_data", {})
+        code = trade_info.get("code", ticker)
+        name = trade_info.get("name", code)  # 获取股票名称，如果没有则使用代码
+        trades = trade_info.get("trades", [])
+
+        # 分析交易行为模式
+        trade_patterns = []
+        for t in trades:
+            price_change = t.get("price_change_before", 0)
+            pattern = "上涨中" if price_change > 0 else "下跌中" if price_change < 0 else "震荡中"
+            trade_patterns.append(
+                f"- {t.get('date', 'N/A')}: {t.get('side', 'N/A')} "
+                f"(交易前市场{pattern}, 变化{price_change:.2%})"
+            )
+        pattern_str = "\n".join(trade_patterns) if trade_patterns else "无法分析交易模式"
+
+        # 格式化收益信息
+        realized_pnl = trade_info.get('realized_pnl', 0)
+        realized_pnl_pct = trade_info.get('realized_pnl_pct', 0)
+        # 🆕 获取浮动盈亏（持仓中时）
+        unrealized_pnl = trade_info.get('unrealized_pnl', 0)
+        unrealized_pnl_pct = trade_info.get('unrealized_pnl_pct', 0)
+        is_holding = trade_info.get('is_holding', False)
+        
+        # 🆕 计算总盈亏（已实现 + 浮动）
+        total_pnl = realized_pnl + unrealized_pnl if is_holding else realized_pnl
+        total_pnl_pct = realized_pnl_pct + unrealized_pnl_pct if is_holding else realized_pnl_pct
+        
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        unrealized_sign = "+" if unrealized_pnl >= 0 else ""
+
+        # 准备模板变量
+        template_variables = {
+            'code': code,
+            'name': name,
+            'trade_count': len(trades),
+            'buy_count': len([t for t in trades if t.get('side') == 'buy']),
+            'sell_count': len([t for t in trades if t.get('side') == 'sell']),
+            'pnl_sign': pnl_sign,
+            'realized_pnl': f"{realized_pnl:.2f}",
+            'realized_pnl_pct': f"{realized_pnl_pct:.2f}",
+            # 🆕 添加浮动盈亏和总盈亏
+            'unrealized_pnl': f"{unrealized_pnl:.2f}",
+            'unrealized_pnl_pct': f"{unrealized_pnl_pct:.2f}",
+            'unrealized_sign': unrealized_sign,
+            'total_pnl': f"{total_pnl:.2f}",
+            'total_pnl_pct': f"{total_pnl_pct:.2f}",
+            'is_holding': "是" if is_holding else "否",
+            'first_buy_date': trade_info.get('first_buy_date', 'N/A'),
+            'last_sell_date': trade_info.get('last_sell_date', 'N/A'),
+            'holding_days': trade_info.get('holding_days', 0),
+            'trade_patterns': pattern_str,
+            'market_summary': market_data.get('summary', '无市场数据')
+        }
+
+        # 🆕 构建收益信息文本（包含浮动盈亏）- 用于模板变量
+        if is_holding and unrealized_pnl != 0:
+            pnl_info_text = f"总收益: {pnl_sign}{total_pnl:.2f}元（{pnl_sign}{total_pnl_pct:.2f}%）\n  - 已实现: {realized_pnl:+.2f}元（{realized_pnl_pct:+.2f}%）\n  - 浮动: {unrealized_sign}{unrealized_pnl:.2f}元（{unrealized_sign}{unrealized_pnl_pct:.2f}%）"
+        else:
+            pnl_info_text = f"总收益: {pnl_sign}{total_pnl:.2f}元（{pnl_sign}{total_pnl_pct:.2f}%）"
+        
+        template_variables['pnl_info'] = pnl_info_text
+        template_variables['holding_status'] = f"{'持仓中' if is_holding else '已平仓'}"
+        
+        # 降级提示词（如果模板系统不可用）
+        fallback_prompt = f"""请分析以下交易的情绪控制：
+
+=== 交易信息 ===
+- 股票代码: {code}
+- 股票名称: {name}
+- 交易次数: {len(trades)} 次（{len([t for t in trades if t.get('side') == 'buy'])} 次买入，{len([t for t in trades if t.get('side') == 'sell'])} 次卖出）
+- {pnl_info_text}
+- 持仓周期: {trade_info.get('first_buy_date', 'N/A')} 至 {trade_info.get('last_sell_date', 'N/A')}（共约 {trade_info.get('holding_days', 0)} 天）
+- 持仓状态: {'持仓中' if is_holding else '已平仓'}
+
+=== 交易行为模式 ===
+{pattern_str}
+
+=== 市场环境 ===
+{market_data.get('summary', '无市场数据')}
+
+**重要提示**：
+- 请在报告标题中使用上述提供的股票代码和股票名称
+- 报告中的所有数据（收益金额、收益率、持仓周期等）必须与上述提供的数据完全一致
+- 不要编造或修改任何数据
+
+请撰写详细的情绪分析报告，包括：
+1. 追涨杀跌行为识别
+2. 恐慌抛售分析
+3. 贪婪持有分析
+4. 交易纪律评估
+5. 需补强的情绪与纪律要点
+
+禁止输出未来买卖指令、止损止盈或仓位调整建议。"""
+
+        # 打印模板变量（调试用）
+        logger.info(f"📊 [情绪分析师] 模板变量:")
+        for key, value in template_variables.items():
+            logger.info(f"  - {key}: {value}")
+
+        # 使用基类的通用方法获取用户提示词
+        prompt = self._get_prompt_from_template(
+            agent_type="reviewers_v2",
+            agent_name="emotion_analyst_v2",
+            variables=template_variables,
+            state=state,  # 🔑 传递 state，基类会自动提取系统变量
+            context=state.get("context") if isinstance(state, dict) else state,  # 从 state 中获取 context
+            fallback_prompt=fallback_prompt,
+            prompt_type="user"  # 🔑 明确指定获取用户提示词
+        )
+        if prompt:
+            logger.info(f"✅ 从模板系统获取情绪分析师用户提示词 (长度: {len(prompt)})")
+            logger.info(f"📝 [情绪分析师] 最终用户提示词:\n{prompt}")
+            return prompt
+
+        # 降级：使用硬编码提示词
+        logger.info(f"📝 [情绪分析师] 使用降级提示词:\n{fallback_prompt}")
+        return fallback_prompt
+
+    def _get_required_reports(self) -> List[str]:
+        """获取需要的数据列表"""
+        return ["trade_info", "market_data"]
+

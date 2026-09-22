@@ -1,0 +1,182 @@
+# Python 环境与缓存
+env/
+venv/
+env-py310/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyc.*
+*.pyo.*
+*.so
+.Python
+*.egg-info/
+tradingagents.egg-info/
+*$py.class
+OpenViking/
+OpenHarness/
+
+# 环境变量与敏感配置
+.env
+.env.local
+.env.*.local
+.env.db
+.env.mongodb*
+.env.jdyun
+frontend/.env*
+
+# 前端依赖与构建产物
+node_modules/
+frontend/node_modules/
+frontend/.vite/
+frontend/dist/
+dist/
+build/
+*.tsbuildinfo
+frontend/.eslintrc-auto-import.json
+frontend/auto-imports.d.ts
+frontend/components.d.ts
+
+# 操作系统与编辑器
+.DS_Store
+Thumbs.db
+ehthumbs.db
+.vscode/
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志、覆盖率与运行时文件
+logs/
+*.log
+*.log*
+*.pid
+*.pid.lock
+.coverage
+.pytest_cache/
+htmlcov/
+runtime/
+temp/
+*.cache
+.streamlit/cache/
+*.tmp
+*.temp
+
+# 文档构建
+docs/_build/
+site/
+
+# 数据文件与缓存
+*.csv
+!docs/examples/social_media_template.csv
+*.xlsx
+*.xls
+config/*.json
+!config/*.json.example
+web/config/*.json
+data/
+web/data/
+eval_results/
+eval_data/
+results/
+web/results/
+web/eval_results/
+/cache/
+# 源码目录中的运行时缓存：忽略运行产物但保留 .py 源码（修复社区版快照丢包问题）
+tradingagents/dataflows/cache/*
+!tradingagents/dataflows/cache/*.py
+dataflows/data_cache/
+tradingagents/dataflows/data_cache/metadata/
+finnhub_data/
+enhanced_analysis_reports/
+china_stocks/
+us_stocks/
+stock_cache/
+*.cache.json
+*_cache.json
+hk_stock_cache.json
+*_stock_data_*.txt
+*_stock_data_*.json
+*_stock_data_*.csv
+
+# 根目录运行产物
+/src/
+/backend/
+/vendors/
+
+# AI 工具目录（.trae/skills 项目 skill 需入库，其余忽略）
+.trae/*
+!.trae/skills/
+.augment/
+
+# 预览版与内部规划文档
+docs/contribution/
+docs/v1.0.0-preview/
+docs/OPTIMIZATION_PLAN.md
+docs/OPTIMIZATION_PLAN_EN.md
+docs/README_OPTIMIZATION.md
+plan/
+*_PREVIEW_README.md
+RELEASE_NOTES_PREVIEW.md
+DEEPSEEK_PREVIEW_README.md
+
+# 历史备份与发布产物
+data_backup_*/
+backups/
+config/backup/
+release/
+*.msi
+*.msix
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.xz
+*.archive
+*.bak
+*.old
+scripts/windows-installer/nsis/*.exe
+scripts/windows-installer/nsis/*.zip
+
+# 本地脚本与临时调试文件
+test_*_conversion.py
+test_*_reports.py
+test_*_function.py
+setup_licensing.py
+test_export_simple.py
+test_wkhtmltopdf.py
+test_mongodb_connection.py
+test_mongodb_fix.py
+verify_database_fix.py
+setup_mongodb_user.py
+scripts/test_time_serialization.py
+scripts/create_mongodb_admin.py
+COMMIT_SUMMARY.md
+
+# 本地服务与部署辅助文件
+start_local_services.bat
+stop_local_services.bat
+nginx/local.nginx.conf
+scripts/deployment/assemble_portable_release.ps1
+scripts/deployment/assemble_portable_release_fixed.ps1
+scripts/deployment/build_portable_release.ps1
+scripts/deployment/package_with_7zip.ps1
+scripts/deployment/quick_sync_and_build.ps1
+scripts/deployment/stage_local_vendors.ps1
+
+# Nanobot 本地运行产物
+/memory/
+nanobot_sessions/
+
+# SearXNG 第三方源码（通过 pip install -e searxng/ 安装，不需要提交）
+/searxng/
+
+# SearXNG wheel 构建产物（deploy-all-in-one/build.sh 生成）
+deploy-all-in-one/wheels/
+
+nul
+node_modules

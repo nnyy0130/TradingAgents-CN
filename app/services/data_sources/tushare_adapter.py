@@ -1,0 +1,311 @@
+"""
+Tushare data source adapter
+"""
+from typing import Optional, Dict
+import logging
+from datetime import datetime, timedelta
+import pandas as pd
+
+from .base import DataSourceAdapter
+
+logger = logging.getLogger(__name__)
+
+
+class TushareAdapter(DataSourceAdapter):
+    """Tusharedata source adapter"""
+
+    def __init__(self):
+        super().__init__()  # 调用父类初始化
+        self._provider = None
+        self._initialize()
+
+    def _initialize(self):
+        """Initialize Tushare provider"""
+        try:
+            from tradingagents.dataflows.providers.china.tushare import get_tushare_provider
+            self._provider = get_tushare_provider()
+        except Exception as e:
+            logger.warning(f"Failed to initialize Tushare provider: {e}")
+            self._provider = None
+
+    @property
+    def name(self) -> str:
+        return "tushare"
+
+    def _get_default_priority(self) -> int:
+        return 3  # highest priority (数字越大优先级越高)  # highest priority
+
+    def get_token_source(self) -> Optional[str]:
+        """获取 Token 来源"""
+        if self._provider:
+            return getattr(self._provider, "token_source", None)
+        return None
+
+    def is_available(self) -> bool:
+        """Check whether Tushare is available"""
+        # 如果未连接，尝试连接
+        if self._provider and not getattr(self._provider, "connected", False):
+            try:
+                self._provider.connect_sync()
+            except Exception as e:
+                logger.debug(f"Tushare: Auto-connect failed: {e}")
+
+        return (
+            self._provider is not None
+            and getattr(self._provider, "connected", False)
+            and self._provider.api is not None
+        )
+
+    def get_stock_list(self) -> Optional[pd.DataFrame]:
+        """Get stock list"""
+        # 如果未连接，尝试连接
+        if self._provider and not self.is_available():
+            logger.info("Tushare: Provider not connected, attempting to connect...")
+            try:
+                self._provider.connect_sync()
+            except Exception as e:
+                logger.warning(f"Tushare: Failed to connect: {e}")
+
+        if not self.is_available():
+            logger.warning("Tushare: Provider is not available")
+            return None
+        try:
+            # 使用 TushareProvider 的同步方法
+            df = self._provider.get_stock_list_sync()
+            if df is not None and not df.empty:
+                logger.info(f"Tushare: Successfully fetched {len(df)} stocks")
+                return df
+        except Exception as e:
+            logger.error(f"Tushare: Failed to fetch stock list: {e}")
+        return None
+
+    def get_daily_basic(self, trade_date: str) -> Optional[pd.DataFrame]:
+        """Get daily basic financial data"""
+        if not self.is_available():
+            return None
+        try:
+            # 🔥 新增 ps, ps_ttm, total_share, float_share, dv_ratio, dv_ttm 字段
+            fields = "ts_code,total_mv,circ_mv,pe,pb,ps,turnover_rate,volume_ratio,pe_ttm,pb_mrq,ps_ttm,total_share,float_share,dv_ratio,dv_ttm"
+            df = self._provider.api.daily_basic(trade_date=trade_date, fields=fields)
+            if df is not None and not df.empty:
+                logger.info(
+                    f"Tushare: Successfully fetched daily data for {trade_date}, {len(df)} records"
+                )
+                return df
+        except Exception as e:
+            logger.error(f"Tushare: Failed to fetch daily data for {trade_date}: {e}")
+        return None
+
+
+    def get_realtime_quotes(self):
+        """Get full-market near real-time quotes via Tushare rt_k fallback
+        Returns dict keyed by 6-digit code: {'000001': {'close': ..., 'pct_chg': ..., 'amount': ...}}
+        
+        🔥 已禁用：Tushare 实时行情接口统一由定时任务 run_tushare_realtime_quotes_hourly 管理
+        避免与每小时31分的定时任务冲突（免费用户每小时只能调用一次）
+        """
+        # 🔥 已禁用 Tushare 实时行情接口调用，统一由定时任务管理
+        logger.info("⏸️ Tushare 实时行情接口已禁用，跳过调用（由定时任务统一管理）")
+        return None
+
+    def get_kline(self, code: str, period: str = "day", limit: int = 120, adj: Optional[str] = None):
+        """Get K-line bars using tushare pro_bar
+        period: day/week/month/5m/15m/30m/60m
+        adj: None/qfq/hfq
+        Returns: list of {time, open, high, low, close, volume, amount}
+        """
+        if not self.is_available():
+            return None
+        try:
+            from tushare.pro.data_pro import pro_bar
+        except Exception:
+            logger.error("Tushare pro_bar not available")
+            return None
+        try:
+            prov = self._provider
+            if prov is None or prov.api is None:
+                return None
+            # normalize ts_code
+            ts_code = prov._normalize_symbol(code) if hasattr(prov, "_normalize_symbol") else code
+            # map period -> freq
+            freq_map = {
+                "day": "D",
+                "week": "W",
+                "month": "M",
+                "5m": "5min",
+                "15m": "15min",
+                "30m": "30min",
+                "60m": "60min",
+            }
+            freq = freq_map.get(period, "D")
+            adj_arg = adj if adj in (None, "qfq", "hfq") else None
+
+            # 根据频率决定请求的字段
+            # 日线及以上周期只有 trade_date，分钟线才有 trade_time
+            if freq in ["5min", "15min", "30min", "60min"]:
+                fields = "open,high,low,close,vol,amount,trade_date,trade_time"
+            else:
+                fields = "open,high,low,close,vol,amount,trade_date"
+
+            df = pro_bar(ts_code=ts_code, api=prov.api, freq=freq, adj=adj_arg, limit=limit, fields=fields)
+            if df is None or getattr(df, 'empty', True):
+                return None
+            # standardize columns
+            items = []
+            # choose time column
+            tcol = 'trade_time' if 'trade_time' in df.columns else 'trade_date' if 'trade_date' in df.columns else None
+            if tcol is None:
+                logger.error(f'Tushare pro_bar missing time column: {list(df.columns)}')
+                return None
+            df = df.sort_values(tcol)
+            for _, row in df.iterrows():
+                tval = row.get(tcol)
+                try:
+                    # keep as string; if Timestamp, convert
+                    time_str = str(tval)
+                    items.append({
+                        "time": time_str,
+                        "open": float(row.get('open')) if row.get('open') is not None else None,
+                        "high": float(row.get('high')) if row.get('high') is not None else None,
+                        "low": float(row.get('low')) if row.get('low') is not None else None,
+                        "close": float(row.get('close')) if row.get('close') is not None else None,
+                        "volume": float(row.get('vol')) if row.get('vol') is not None else None,
+                        "amount": float(row.get('amount')) if row.get('amount') is not None else None,
+                    })
+                except Exception:
+                    continue
+            return items
+        except Exception as e:
+            logger.error(f"Failed to fetch kline from Tushare: {e}")
+            return None
+
+    def get_news(self, code: str, days: int = 2, limit: int = 50, include_announcements: bool = True):
+        """Try to fetch news/announcements via tushare pro api if available.
+        Returns list of {title, source, time, url, type}
+        """
+        if not self.is_available():
+            return None
+        api = self._provider.api if self._provider else None
+        if api is None:
+            return None
+        items = []
+        # resolve ts_code and date range
+        try:
+            ts_code = self._provider._normalize_symbol(code) if hasattr(self._provider, "_normalize_symbol") else code
+        except Exception:
+            ts_code = code
+        try:
+            from datetime import datetime, timedelta
+            end = datetime.now()
+            start = end - timedelta(days=max(1, days))
+            start_str = start.strftime('%Y%m%d')
+            end_str = end.strftime('%Y%m%d')
+        except Exception:
+            start_str = end_str = ""
+        # Attempt announcements first (if requested)
+        try:
+            if include_announcements and hasattr(api, 'anns'):
+                df_anns = api.anns(ts_code=ts_code, start_date=start_str, end_date=end_str)
+                if df_anns is not None and not df_anns.empty:
+                    for _, row in df_anns.head(limit).iterrows():
+                        items.append({
+                            "title": row.get('title') or row.get('ann_title') or '',
+                            "source": "tushare",
+                            "time": str(row.get('ann_date') or row.get('pub_date') or ''),
+                            "url": row.get('url') or row.get('ann_url') or '',
+                            "type": "announcement",
+                        })
+        except Exception:
+            pass
+        # Attempt news
+        try:
+            if hasattr(api, 'news'):
+                df_news = api.news(ts_code=ts_code, start_date=start_str, end_date=end_str)
+                if df_news is not None and not df_news.empty:
+                    for _, row in df_news.head(max(0, limit - len(items))).iterrows():
+                        items.append({
+                            "title": row.get('title') or '',
+                            "source": row.get('src') or 'tushare',
+                            "time": str(row.get('pub_time') or row.get('pub_date') or ''),
+                            "url": row.get('url') or '',
+                            "type": "news",
+                        })
+        except Exception:
+            pass
+        return items if items else None
+
+    def find_latest_trade_date(self) -> Optional[str]:
+        """通过交易日历API查找最新交易日期（带缓存）"""
+        if not self.is_available():
+            return None
+        
+        # 先尝试从缓存获取
+        try:
+            from app.services.trade_date_cache_service import get_trade_date_cache_service
+            
+            cache_service = get_trade_date_cache_service()
+            cached_date = cache_service.get_cached_trade_date_sync("tushare")
+            if cached_date:
+                logger.debug(f"Tushare: Using cached trade date: {cached_date}")
+                return cached_date
+        except Exception as e:
+            logger.debug(f"Tushare: Cache check failed: {e}, will fetch from API")
+        
+        # 缓存不存在或已过期，调用API获取
+        try:
+            api = self._provider.api if self._provider else None
+            if api is None:
+                return None
+            
+            # 从今天向前1个月，获取交易日历
+            today = datetime.now()
+            end_date = today.strftime("%Y%m%d")
+            start_date = (today - timedelta(days=30)).strftime("%Y%m%d")
+            
+            # 调用 trade_cal API 获取交易日历
+            df = api.trade_cal(exchange='SSE', start_date=start_date, end_date=end_date)
+            
+            if df is not None and not df.empty:
+                # 筛选出交易日（is_open == 1）
+                trading_days = df[df['is_open'] == 1]
+                if not trading_days.empty:
+                    # 按日期排序，取最后一个（最新的交易日）
+                    trading_days = trading_days.sort_values('cal_date', ascending=False)
+                    latest_date = str(trading_days.iloc[0]['cal_date'])
+                    logger.info(f"Tushare: Found latest trade date from calendar: {latest_date}")
+                    
+                    # 保存到缓存
+                    try:
+                        from app.services.trade_date_cache_service import get_trade_date_cache_service
+                        cache_service = get_trade_date_cache_service()
+                        cache_service.set_cached_trade_date_sync("tushare", latest_date)
+                    except Exception as e:
+                        logger.debug(f"Tushare: Failed to cache trade date: {e}")
+                    
+                    return latest_date
+            
+            # 如果交易日历API失败，回退到原来的方法
+            logger.warning("Tushare: Trade calendar API failed, falling back to daily_basic probing")
+            for delta in range(0, 10):  # up to 10 days back
+                d = (today - timedelta(days=delta)).strftime("%Y%m%d")
+                try:
+                    db = api.daily_basic(trade_date=d, fields="ts_code,total_mv")
+                    if db is not None and not db.empty:
+                        logger.info(f"Tushare: Found latest trade date by probing: {d}")
+                        
+                        # 保存到缓存
+                        try:
+                            import asyncio
+                            from app.services.trade_date_cache_service import get_trade_date_cache_service
+                            cache_service = get_trade_date_cache_service()
+                            asyncio.run(cache_service.set_cached_trade_date("tushare", d))
+                        except Exception as e:
+                            logger.debug(f"Tushare: Failed to cache trade date: {e}")
+                        
+                        return d
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.error(f"Tushare: Failed to find latest trade date: {e}")
+        return None
+

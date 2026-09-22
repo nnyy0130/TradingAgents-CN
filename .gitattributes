@@ -1,0 +1,3 @@
+deploy-all-in-one/s6-rc.d/**/run text eol=lf
+deploy-all-in-one/s6-rc.d/**/type text eol=lf
+*.sh text eol=lf
